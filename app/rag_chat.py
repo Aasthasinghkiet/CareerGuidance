@@ -2,18 +2,24 @@ import re
 from app.job_matcher import recommend_jobs
 import os
 from pathlib import Path
-
+import re
+from rank_bm25 import BM25Okapi
+from langchain_core.documents import Document
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
+import hashlib
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 CHROMA_DIR = ROOT / "data" / "chroma_db"
 COLLECTION_NAME = "arogyini_career_knowledge"
+RETRIEVAL_MODE = os.getenv(
+    "AROGYINI_RETRIEVAL_MODE", "vector"
+).lower()
 
 
 # --------------------------------------------------
@@ -563,6 +569,136 @@ or what resources do you have access to at home?
 # --------------------------------------------------
 
 
+# --------------------------------------------------
+# Hybrid retrieval: BM25 + Chroma vector search
+# --------------------------------------------------
+
+_BM25_INDEX = None
+_BM25_DOCUMENTS = None
+
+
+def tokenize_text(text):
+    """Tokenize text for BM25 keyword retrieval."""
+    return re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+
+
+def build_bm25_index(vectorstore):
+    """Build an in-memory BM25 index from stored Chroma chunks."""
+    global _BM25_INDEX, _BM25_DOCUMENTS
+
+    if _BM25_INDEX is not None:
+        return
+
+    stored = vectorstore.get(
+        include=["documents", "metadatas"]
+    )
+
+    texts = stored.get("documents") or []
+    metadatas = stored.get("metadatas") or []
+
+    documents = []
+
+    for text, metadata in zip(texts, metadatas):
+        if not text or not text.strip():
+            continue
+
+        documents.append(
+            Document(
+                page_content=text,
+                metadata=metadata or {},
+            )
+        )
+
+    if not documents:
+        _BM25_INDEX = None
+        _BM25_DOCUMENTS = []
+        return
+
+    tokenized_corpus = [
+        tokenize_text(doc.page_content)
+        for doc in documents
+    ]
+
+    _BM25_INDEX = BM25Okapi(tokenized_corpus)
+    _BM25_DOCUMENTS = documents
+
+
+def hybrid_retrieve(
+    question,
+    vectorstore,
+    allowed_sources,
+    k=6,
+    candidate_k=12,
+):
+    """
+    Combine BM25 and vector rankings using Reciprocal Rank Fusion.
+    Restrict both methods to the permitted source files.
+    """
+    build_bm25_index(vectorstore)
+
+    if not _BM25_DOCUMENTS:
+        return vectorstore.similarity_search(
+            question,
+            k=k,
+            filter={"source_file": {"$in": allowed_sources}},
+        )
+
+    # Vector candidates, restricted to the selected source group.
+    vector_docs = vectorstore.similarity_search(
+        question,
+        k=candidate_k,
+        filter={"source_file": {"$in": allowed_sources}},
+    )
+
+    # BM25 candidates, restricted to the same source group.
+    query_tokens = tokenize_text(question)
+    scores = _BM25_INDEX.get_scores(query_tokens)
+
+    allowed = set(allowed_sources)
+    bm25_candidates = [
+        (index, score)
+        for index, score in enumerate(scores)
+        if _BM25_DOCUMENTS[index].metadata.get("source_file") in allowed
+    ]
+    bm25_candidates.sort(key=lambda item: item[1], reverse=True)
+    bm25_docs = [
+        _BM25_DOCUMENTS[index]
+        for index, score in bm25_candidates[:candidate_k]
+    ]
+
+    # Reciprocal Rank Fusion combines rankings, not raw scores.
+    fused_scores = {}
+    documents_by_key = {}
+
+    def add_ranked_results(documents, weight=1.0, rrf_constant=60):
+        for rank, doc in enumerate(documents, start=1):
+            key = (
+                doc.metadata.get("chunk_id")
+                or doc.metadata.get("record_id")
+                or hashlib.sha256(
+                    doc.page_content.encode("utf-8")
+                ).hexdigest()
+            )
+
+            fused_scores[key] = fused_scores.get(key, 0.0) + (
+                weight / (rrf_constant + rank)
+            )
+            documents_by_key[key] = doc
+
+    add_ranked_results(vector_docs, weight=2.0)
+    add_ranked_results(bm25_docs, weight=1.0)
+
+    ranked_keys = sorted(
+        fused_scores,
+        key=lambda key: fused_scores[key],
+        reverse=True,
+    )
+
+    return [
+        documents_by_key[key]
+        for key in ranked_keys[:k]
+    ]
+
 
 def answer_question(question, vectorstore, llm, prompt):
     # Respect the user's preference not to take a job.
@@ -589,18 +725,32 @@ def answer_question(question, vectorstore, llm, prompt):
     allowed_sources = SOURCE_GROUPS[group]
 
 
-    docs = vectorstore.similarity_search(
-        question,
-        k=6,
-        filter={"source_file": {"$in": allowed_sources}},
-    )
+    
+    if RETRIEVAL_MODE == "hybrid":
+        docs = hybrid_retrieve(
+             question=question,
+             vectorstore=vectorstore,
+             allowed_sources=allowed_sources,
+             k=6,
+            candidate_k=12,
+        )
+    else:
+         docs = vectorstore.similarity_search(
+             question,
+             k=6,
+             filter={"source_file": {"$in": allowed_sources}},
+        )
 
+# Keep this fallback check
     if not docs and group != "jobs":
-      return (
-        "I couldn't find enough relevant information in my current "
-        "knowledge base to give a reliable answer. I can still help "
-        "you identify what to look for, but I won't invent details."
-    )
+        return (
+          "I couldn't find enough relevant information in my current "
+           "knowledge base to give a reliable answer. I can still help "
+          "you identify what to look for, but I won't invent details."
+        )
+
+
+    
 
     context_parts = []
     retrieved_sources = []
